@@ -1,9 +1,10 @@
 import * as Yup from 'yup';
 import { startOfHour, parseISO, isBefore, format, subHours } from 'date-fns';
 import pt from 'date-fns/locale/pt';
+
+import Appointment from '../models/Appointment';
 import User from '../models/User';
 import File from '../models/File';
-import Appointment from '../models/Appointment';
 import Notification from '../schemas/Notification';
 
 import CancellationMail from '../jobs/CancellationMail';
@@ -11,7 +12,7 @@ import Queue from '../../lib/Queue';
 
 class AppointmentController {
   async index(req, res) {
-    const { page } = req.query;
+    const { page = 1 } = req.query;
 
     const appointments = await Appointment.findAll({
       where: { user_id: req.userId, canceled_at: null },
@@ -39,48 +40,50 @@ class AppointmentController {
   }
 
   async store(req, res) {
+    // schema de validação
     const schema = Yup.object().shape({
       provider_id: Yup.number().required(),
       date: Yup.date().required(),
     });
 
+    // caso a requisição não passe pela schema
     if (!(await schema.isValid(req.body))) {
       return res.status(400).json({ error: 'Validation fails' });
     }
 
     const { provider_id, date } = req.body;
 
-    /**
-     * Check if provider_id is a provider
-     */
-    const checkIsProvider = await User.findOne({
+    // checa se o provider_id pertence a um provider
+    const isProvider = await User.findOne({
       where: { id: provider_id, provider: true },
     });
 
-    if (!checkIsProvider) {
+    // checa se é um provedor de serviços
+    if (!isProvider) {
       return res
         .status(401)
         .json({ error: 'You can only create appointments with providers' });
     }
 
-    if (provider_id === req.userId) {
+    // checa se o usuário está marcando com ele mesmo
+    if (req.userId === provider_id) {
       return res
         .status(401)
-        .json({ error: 'Provider cannot make an appointment for you' });
+        .json({ error: 'You cannot create an appointment with yourself' });
     }
 
     /**
-     * Check for past dates
+     * parseISO() transforma date em um objeto Date
+     * startOfHour() zera os minutos e segundos
      */
     const hourStart = startOfHour(parseISO(date));
 
+    // checa se a data já passou
     if (isBefore(hourStart, new Date())) {
       return res.status(400).json({ error: 'Past dates are not permitted' });
     }
 
-    /**
-     * Check date availability
-     */
+    // checa a disponibilidade no horario
     const checkAvailability = await Appointment.findOne({
       where: {
         provider_id,
@@ -102,7 +105,7 @@ class AppointmentController {
     });
 
     /**
-     * Notify appointment provider
+     * Notificar prestador de serviço
      */
     const user = await User.findByPk(req.userId);
     const formattedDate = format(
@@ -112,7 +115,7 @@ class AppointmentController {
     );
 
     await Notification.create({
-      content: `Novo agendamento de ${user.name} para o ${formattedDate}`,
+      content: `Novo agendamento de ${user.name} para ${formattedDate}`,
       user: provider_id,
     });
 
@@ -135,14 +138,16 @@ class AppointmentController {
       ],
     });
 
+    // caso o usuário esteja deletando um agendamento que não é dele
     if (appointment.user_id !== req.userId) {
       return res.status(401).json({
-        error: "You don't permission to cancel this appointment",
+        error: "You don't have permission to cancel this appointment.",
       });
     }
 
     const dateWithSub = subHours(appointment.date, 2);
 
+    // checa se o limite foi extrapolado, o limite é de 2 horas
     if (isBefore(dateWithSub, new Date())) {
       return res.status(401).json({
         error: 'You can only cancel appointments 2 hours in advance.',
@@ -152,6 +157,10 @@ class AppointmentController {
     appointment.canceled_at = new Date();
 
     await appointment.save();
+
+    /** o objeto passado é recuperado dentro de CancellationMail
+     * dentro da variavel data
+     *  */
 
     await Queue.add(CancellationMail.key, {
       appointment,
